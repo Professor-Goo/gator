@@ -1,13 +1,20 @@
 package main
 
 import (
+	"context"
+	"database/sql"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/Professor-Goo/gator/internal/config"
+	"github.com/Professor-Goo/gator/internal/database"
+	"github.com/google/uuid"
+	_ "github.com/lib/pq"
 )
 
 type state struct {
+	db  *database.Queries
 	cfg *config.Config
 }
 
@@ -38,11 +45,55 @@ func handlerLogin(s *state, cmd command) error {
 	}
 
 	username := cmd.args[0]
+
+	// Check if user exists in database
+	_, err := s.db.GetUser(context.Background(), username)
+	if err != nil {
+		return fmt.Errorf("user does not exist: %w", err)
+	}
+
 	if err := s.cfg.SetUser(username); err != nil {
 		return fmt.Errorf("couldn't set current user: %w", err)
 	}
 
 	fmt.Printf("User has been set to: %s\n", username)
+	return nil
+}
+
+func handlerRegister(s *state, cmd command) error {
+	if len(cmd.args) == 0 {
+		return fmt.Errorf("register requires a username argument")
+	}
+
+	username := cmd.args[0]
+
+	// Check if user already exists
+	_, err := s.db.GetUser(context.Background(), username)
+	if err == nil {
+		return fmt.Errorf("user already exists: %s", username)
+	}
+
+	// Create new user
+	user, err := s.db.CreateUser(context.Background(), database.CreateUserParams{
+		ID:        uuid.New(),
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+		Name:      username,
+	})
+	if err != nil {
+		return fmt.Errorf("couldn't create user: %w", err)
+	}
+
+	// Set as current user
+	if err := s.cfg.SetUser(username); err != nil {
+		return fmt.Errorf("couldn't set current user: %w", err)
+	}
+
+	fmt.Println("User created successfully:")
+	fmt.Printf("  ID: %s\n", user.ID)
+	fmt.Printf("  Name: %s\n", user.Name)
+	fmt.Printf("  Created: %s\n", user.CreatedAt)
+
 	return nil
 }
 
@@ -53,7 +104,17 @@ func main() {
 		os.Exit(1)
 	}
 
+	db, err := sql.Open("postgres", cfg.DbURL)
+	if err != nil {
+		fmt.Printf("Error opening database: %v\n", err)
+		os.Exit(1)
+	}
+	defer db.Close()
+
+	dbQueries := database.New(db)
+
 	appState := &state{
+		db:  dbQueries,
 		cfg: &cfg,
 	}
 
@@ -61,6 +122,7 @@ func main() {
 		handlers: make(map[string]func(*state, command) error),
 	}
 	cmds.register("login", handlerLogin)
+	cmds.register("register", handlerRegister)
 
 	if len(os.Args) < 2 {
 		fmt.Println("Error: not enough arguments provided")

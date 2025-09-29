@@ -46,7 +46,6 @@ func handlerLogin(s *state, cmd command) error {
 
 	username := cmd.args[0]
 
-	// Check if user exists in database
 	_, err := s.db.GetUser(context.Background(), username)
 	if err != nil {
 		return fmt.Errorf("user does not exist: %w", err)
@@ -67,13 +66,11 @@ func handlerRegister(s *state, cmd command) error {
 
 	username := cmd.args[0]
 
-	// Check if user already exists
 	_, err := s.db.GetUser(context.Background(), username)
 	if err == nil {
 		return fmt.Errorf("user already exists: %s", username)
 	}
 
-	// Create new user
 	user, err := s.db.CreateUser(context.Background(), database.CreateUserParams{
 		ID:        uuid.New(),
 		CreatedAt: time.Now(),
@@ -84,7 +81,6 @@ func handlerRegister(s *state, cmd command) error {
 		return fmt.Errorf("couldn't create user: %w", err)
 	}
 
-	// Set as current user
 	if err := s.cfg.SetUser(username); err != nil {
 		return fmt.Errorf("couldn't set current user: %w", err)
 	}
@@ -94,6 +90,15 @@ func handlerRegister(s *state, cmd command) error {
 	fmt.Printf("  Name: %s\n", user.Name)
 	fmt.Printf("  Created: %s\n", user.CreatedAt)
 
+	return nil
+}
+
+func handlerReset(s *state, cmd command) error {
+	if err := s.db.DeleteAllUsers(context.Background()); err != nil {
+		return fmt.Errorf("couldn't reset database: %w", err)
+	}
+
+	fmt.Println("Database reset successfully")
 	return nil
 }
 
@@ -123,6 +128,7 @@ func main() {
 	}
 	cmds.register("login", handlerLogin)
 	cmds.register("register", handlerRegister)
+	cmds.register("reset", handlerReset)
 
 	if len(os.Args) < 2 {
 		fmt.Println("Error: not enough arguments provided")

@@ -3,7 +3,11 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/xml"
 	"fmt"
+	"html"
+	"io"
+	"net/http"
 	"os"
 	"time"
 
@@ -25,6 +29,57 @@ type command struct {
 
 type commands struct {
 	handlers map[string]func(*state, command) error
+}
+
+type RSSFeed struct {
+	Channel struct {
+		Title       string    `xml:"title"`
+		Link        string    `xml:"link"`
+		Description string    `xml:"description"`
+		Item        []RSSItem `xml:"item"`
+	} `xml:"channel"`
+}
+
+type RSSItem struct {
+	Title       string `xml:"title"`
+	Link        string `xml:"link"`
+	Description string `xml:"description"`
+	PubDate     string `xml:"pubDate"`
+}
+
+func fetchFeed(ctx context.Context, feedURL string) (*RSSFeed, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", feedURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "gator")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var feed RSSFeed
+	if err := xml.Unmarshal(data, &feed); err != nil {
+		return nil, err
+	}
+
+	// Decode HTML entities
+	feed.Channel.Title = html.UnescapeString(feed.Channel.Title)
+	feed.Channel.Description = html.UnescapeString(feed.Channel.Description)
+	for i := range feed.Channel.Item {
+		feed.Channel.Item[i].Title = html.UnescapeString(feed.Channel.Item[i].Title)
+		feed.Channel.Item[i].Description = html.UnescapeString(feed.Channel.Item[i].Description)
+	}
+
+	return &feed, nil
 }
 
 func (c *commands) register(name string, f func(*state, command) error) {
@@ -249,6 +304,54 @@ func handlerUnfollow(s *state, cmd command, user database.User) error {
 	return nil
 }
 
+func handlerAgg(s *state, cmd command) error {
+	if len(cmd.args) == 0 {
+		return fmt.Errorf("agg requires a time_between_reqs argument")
+	}
+
+	timeBetweenRequests, err := time.ParseDuration(cmd.args[0])
+	if err != nil {
+		return fmt.Errorf("invalid duration: %w", err)
+	}
+
+	fmt.Printf("Collecting feeds every %s\n", timeBetweenRequests)
+
+	ticker := time.NewTicker(timeBetweenRequests)
+	defer ticker.Stop()
+
+	for ; ; <-ticker.C {
+		if err := scrapeFeeds(s); err != nil {
+			fmt.Printf("Error scraping feeds: %v\n", err)
+		}
+	}
+}
+
+func scrapeFeeds(s *state) error {
+	feed, err := s.db.GetNextFeedToFetch(context.Background())
+	if err != nil {
+		return fmt.Errorf("couldn't get next feed to fetch: %w", err)
+	}
+
+	fmt.Printf("Fetching feed: %s\n", feed.Name)
+
+	err = s.db.MarkFeedFetched(context.Background(), feed.ID)
+	if err != nil {
+		return fmt.Errorf("couldn't mark feed as fetched: %w", err)
+	}
+
+	rssFeed, err := fetchFeed(context.Background(), feed.Url)
+	if err != nil {
+		return fmt.Errorf("couldn't fetch feed: %w", err)
+	}
+
+	fmt.Printf("Found %d posts in %s\n", len(rssFeed.Channel.Item), feed.Name)
+	for _, item := range rssFeed.Channel.Item {
+		fmt.Printf("  - %s\n", item.Title)
+	}
+
+	return nil
+}
+
 func main() {
 	cfg, err := config.Read()
 	if err != nil {
@@ -282,6 +385,7 @@ func main() {
 	cmds.register("follow", middlewareLoggedIn(handlerFollow))
 	cmds.register("following", middlewareLoggedIn(handlerFollowing))
 	cmds.register("unfollow", middlewareLoggedIn(handlerUnfollow))
+	cmds.register("agg", handlerAgg)
 
 	if len(os.Args) < 2 {
 		fmt.Println("Error: not enough arguments provided")

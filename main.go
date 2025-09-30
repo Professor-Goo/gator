@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/Professor-Goo/gator/internal/config"
@@ -29,57 +30,6 @@ type command struct {
 
 type commands struct {
 	handlers map[string]func(*state, command) error
-}
-
-type RSSFeed struct {
-	Channel struct {
-		Title       string    `xml:"title"`
-		Link        string    `xml:"link"`
-		Description string    `xml:"description"`
-		Item        []RSSItem `xml:"item"`
-	} `xml:"channel"`
-}
-
-type RSSItem struct {
-	Title       string `xml:"title"`
-	Link        string `xml:"link"`
-	Description string `xml:"description"`
-	PubDate     string `xml:"pubDate"`
-}
-
-func fetchFeed(ctx context.Context, feedURL string) (*RSSFeed, error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", feedURL, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("User-Agent", "gator")
-
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	var feed RSSFeed
-	if err := xml.Unmarshal(data, &feed); err != nil {
-		return nil, err
-	}
-
-	// Decode HTML entities
-	feed.Channel.Title = html.UnescapeString(feed.Channel.Title)
-	feed.Channel.Description = html.UnescapeString(feed.Channel.Description)
-	for i := range feed.Channel.Item {
-		feed.Channel.Item[i].Title = html.UnescapeString(feed.Channel.Item[i].Title)
-		feed.Channel.Item[i].Description = html.UnescapeString(feed.Channel.Item[i].Description)
-	}
-
-	return &feed, nil
 }
 
 func (c *commands) register(name string, f func(*state, command) error) {
@@ -304,6 +254,131 @@ func handlerUnfollow(s *state, cmd command, user database.User) error {
 	return nil
 }
 
+type RSSFeed struct {
+	Channel struct {
+		Title       string    `xml:"title"`
+		Link        string    `xml:"link"`
+		Description string    `xml:"description"`
+		Item        []RSSItem `xml:"item"`
+	} `xml:"channel"`
+}
+
+type RSSItem struct {
+	Title       string `xml:"title"`
+	Link        string `xml:"link"`
+	Description string `xml:"description"`
+	PubDate     string `xml:"pubDate"`
+}
+
+func fetchFeed(ctx context.Context, feedURL string) (*RSSFeed, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", feedURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "gator")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var feed RSSFeed
+	if err := xml.Unmarshal(data, &feed); err != nil {
+		return nil, err
+	}
+
+	feed.Channel.Title = html.UnescapeString(feed.Channel.Title)
+	feed.Channel.Description = html.UnescapeString(feed.Channel.Description)
+	for i := range feed.Channel.Item {
+		feed.Channel.Item[i].Title = html.UnescapeString(feed.Channel.Item[i].Title)
+		feed.Channel.Item[i].Description = html.UnescapeString(feed.Channel.Item[i].Description)
+	}
+
+	return &feed, nil
+}
+
+func scrapeFeeds(s *state) error {
+	feed, err := s.db.GetNextFeedToFetch(context.Background())
+	if err != nil {
+		return fmt.Errorf("couldn't get next feed to fetch: %w", err)
+	}
+
+	fmt.Printf("Fetching feed: %s\n", feed.Name)
+
+	err = s.db.MarkFeedFetched(context.Background(), feed.ID)
+	if err != nil {
+		return fmt.Errorf("couldn't mark feed as fetched: %w", err)
+	}
+
+	rssFeed, err := fetchFeed(context.Background(), feed.Url)
+	if err != nil {
+		return fmt.Errorf("couldn't fetch feed: %w", err)
+	}
+
+	fmt.Printf("Found %d posts in %s\n", len(rssFeed.Channel.Item), feed.Name)
+
+	for _, item := range rssFeed.Channel.Item {
+		publishedAt := sql.NullTime{}
+		if t, err := time.Parse(time.RFC1123Z, item.PubDate); err == nil {
+			publishedAt = sql.NullTime{Time: t, Valid: true}
+		}
+
+		_, err = s.db.CreatePost(context.Background(), database.CreatePostParams{
+			ID:          uuid.New(),
+			CreatedAt:   time.Now(),
+			UpdatedAt:   time.Now(),
+			Title:       item.Title,
+			Url:         item.Link,
+			Description: sql.NullString{String: item.Description, Valid: item.Description != ""},
+			PublishedAt: publishedAt,
+			FeedID:      feed.ID,
+		})
+		if err != nil {
+			if !isDuplicateKeyError(err) {
+				fmt.Printf("Error creating post: %v\n", err)
+			}
+			continue
+		}
+
+		fmt.Printf("  Saved: %s\n", item.Title)
+	}
+
+	return nil
+}
+
+func isDuplicateKeyError(err error) bool {
+	return err != nil && (
+	// PostgreSQL unique violation error code
+	err.Error() == "pq: duplicate key value violates unique constraint \"posts_url_key\"" ||
+		// Generic check for duplicate key errors
+		contains(err.Error(), "duplicate") ||
+		contains(err.Error(), "unique constraint"))
+}
+
+func contains(s, substr string) bool {
+	return len(s) >= len(substr) && (s == substr ||
+		(len(s) > len(substr) &&
+			(s[:len(substr)] == substr ||
+				s[len(s)-len(substr):] == substr ||
+				indexOf(s, substr) >= 0)))
+}
+
+func indexOf(s, substr string) int {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return i
+		}
+	}
+	return -1
+}
+
 func handlerAgg(s *state, cmd command) error {
 	if len(cmd.args) == 0 {
 		return fmt.Errorf("agg requires a time_between_reqs argument")
@@ -326,28 +401,41 @@ func handlerAgg(s *state, cmd command) error {
 	}
 }
 
-func scrapeFeeds(s *state) error {
-	feed, err := s.db.GetNextFeedToFetch(context.Background())
+func handlerBrowse(s *state, cmd command, user database.User) error {
+	limit := 2
+	if len(cmd.args) > 0 {
+		var err error
+		limit, err = strconv.Atoi(cmd.args[0])
+		if err != nil {
+			return fmt.Errorf("invalid limit: %w", err)
+		}
+	}
+
+	posts, err := s.db.GetPostsForUser(context.Background(), database.GetPostsForUserParams{
+		UserID: user.ID,
+		Limit:  int32(limit),
+	})
 	if err != nil {
-		return fmt.Errorf("couldn't get next feed to fetch: %w", err)
+		return fmt.Errorf("couldn't get posts: %w", err)
 	}
 
-	fmt.Printf("Fetching feed: %s\n", feed.Name)
-
-	err = s.db.MarkFeedFetched(context.Background(), feed.ID)
-	if err != nil {
-		return fmt.Errorf("couldn't mark feed as fetched: %w", err)
+	fmt.Printf("Found %d posts:\n", len(posts))
+	for _, post := range posts {
+		fmt.Printf("\n===========================================\n")
+		fmt.Printf("Title: %s\n", post.Title)
+		fmt.Printf("URL: %s\n", post.Url)
+		if post.PublishedAt.Valid {
+			fmt.Printf("Published: %s\n", post.PublishedAt.Time.Format("2006-01-02 15:04:05"))
+		}
+		if post.Description.Valid && post.Description.String != "" {
+			description := post.Description.String
+			if len(description) > 200 {
+				description = description[:200] + "..."
+			}
+			fmt.Printf("Description: %s\n", description)
+		}
 	}
-
-	rssFeed, err := fetchFeed(context.Background(), feed.Url)
-	if err != nil {
-		return fmt.Errorf("couldn't fetch feed: %w", err)
-	}
-
-	fmt.Printf("Found %d posts in %s\n", len(rssFeed.Channel.Item), feed.Name)
-	for _, item := range rssFeed.Channel.Item {
-		fmt.Printf("  - %s\n", item.Title)
-	}
+	fmt.Printf("\n===========================================\n")
 
 	return nil
 }
@@ -386,6 +474,7 @@ func main() {
 	cmds.register("following", middlewareLoggedIn(handlerFollowing))
 	cmds.register("unfollow", middlewareLoggedIn(handlerUnfollow))
 	cmds.register("agg", handlerAgg)
+	cmds.register("browse", middlewareLoggedIn(handlerBrowse))
 
 	if len(os.Args) < 2 {
 		fmt.Println("Error: not enough arguments provided")
